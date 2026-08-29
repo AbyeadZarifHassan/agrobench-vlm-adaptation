@@ -81,7 +81,7 @@ def bootstrap_diff_ci(
 
 def load_run(path: Path) -> list[dict]:
     records = []
-    with path.open() as fh:
+    with path.open(encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if line:
@@ -89,6 +89,15 @@ def load_run(path: Path) -> list[dict]:
                     records.append(json.loads(line))
                 except json.JSONDecodeError:
                     print(f"[warn] skipping malformed line in {path.name}")
+
+    ids = [r.get("sample_id") for r in records]
+    if len(set(ids)) != len(ids):
+        dupes = len(ids) - len(set(ids))
+        print(f"[ERROR] {path.name} contains {dupes} duplicate sample_ids. "
+              "Paired comparison keys on sample_id, so duplicates overwrite "
+              "each other and the result is computed on an arbitrary subset. "
+              "Re-run this evaluation with --overwrite using a version of "
+              "data.py that builds unique ids.")
     return records
 
 
@@ -130,12 +139,40 @@ def report_single(records: list[dict], top_k: int = 12) -> dict:
     print("=" * 72)
 
     # ---- per task ----
-    print("\nPER CATEGORY  (worst first -- this is where to aim)")
+    # AgroBench's category field is a fine-grained taxonomy with hundreds of
+    # values, most holding one or two samples. A row with n=1 reads as 0.000 or
+    # 1.000 accuracy and means nothing, so only groups large enough to
+    # interpret are shown, with the remainder pooled.
+    MIN_N = 20
+    cat_rows = _group_accuracy(records, "category")
+    big = [r for r in cat_rows if r[1] >= MIN_N]
+    small = [r for r in cat_rows if r[1] < MIN_N]
+
+    print(f"\nPER CATEGORY  (worst first; groups with n<{MIN_N} pooled below)")
     print(f"  {'category':<34} {'n':>5} {'acc':>7} {'95% CI':>16} {'chance':>7}")
-    for name, cn, cacc, clo, chi, cch in _group_accuracy(records, "category"):
+    for name, cn, cacc, clo, chi, cch in big:
         flag = "  <-- at/below chance" if chi < cch else ""
         print(f"  {name:<34} {cn:>5} {cacc:>7.3f} "
               f"[{clo:.3f},{chi:.3f}] {cch:>7.3f}{flag}")
+    if small:
+        s_n = sum(r[1] for r in small)
+        s_correct = sum(
+            r["correct"] for r in records
+            if r.get("category") in {x[0] for x in small}
+        )
+        s_lo, s_hi = wilson_interval(s_correct, s_n)
+        print(f"  {f'[{len(small)} small groups pooled]':<34} {s_n:>5} "
+              f"{s_correct/s_n:>7.3f} [{s_lo:.3f},{s_hi:.3f}]")
+
+    # ---- per source (the AgroBench task identifier) ----
+    sources = {r.get("source", "") for r in records}
+    if len(sources) > 1 and sources != {""}:
+        print("\nPER SOURCE / TASK  (worst first)")
+        print(f"  {'source':<34} {'n':>5} {'acc':>7} {'95% CI':>16} {'chance':>7}")
+        for name, cn, cacc, clo, chi, cch in _group_accuracy(records, "source"):
+            flag = "  <-- at/below chance" if chi < cch else ""
+            print(f"  {name:<34} {cn:>5} {cacc:>7.3f} "
+                  f"[{clo:.3f},{chi:.3f}] {cch:>7.3f}{flag}")
 
     # ---- position bias ----
     preds = [r["pred_index"] for r in records if r["pred_index"] is not None]
@@ -275,18 +312,43 @@ def report_compare(base: list[dict], mod: list[dict],
     if ci_lo < 0 < ci_hi:
         print("  Note: the CI spans zero, which agrees with the test above.")
 
-    # per-category deltas
-    cats = sorted({a[s].get("category", "unknown") for s in shared})
-    if len(cats) > 1:
-        print("\n  PER CATEGORY")
-        print(f"    {'category':<34} {'n':>5} {name_a[:8]:>9} {name_b[:8]:>9} {'delta':>8}")
-        for cat in cats:
-            ids = [s for s in shared if a[s].get("category") == cat]
+    # per source (AgroBench task id) and per category, small groups pooled
+    for field, label in (("source", "SOURCE / TASK"), ("category", "CATEGORY")):
+        vals = {a[s].get(field, "") for s in shared}
+        if len(vals) <= 1 or vals == {""}:
+            continue
+        min_n = 20 if field == "category" else 1
+        rows_out = []
+        pooled_ids: list[str] = []
+        for val in sorted(vals):
+            ids = [s for s in shared if a[s].get(field) == val]
             if not ids:
+                continue
+            if len(ids) < min_n:
+                pooled_ids += ids
                 continue
             ca = sum(a[s]["correct"] for s in ids) / len(ids)
             cb = sum(b[s]["correct"] for s in ids) / len(ids)
-            print(f"    {cat:<34} {len(ids):>5} {ca:>9.3f} {cb:>9.3f} {cb-ca:>+8.3f}")
+            gain = sum(1 for s in ids if not a[s]["correct"] and b[s]["correct"])
+            loss = sum(1 for s in ids if a[s]["correct"] and not b[s]["correct"])
+            rows_out.append((val, len(ids), ca, cb, cb - ca,
+                             binom_two_sided_p(gain, loss)))
+
+        if not rows_out and not pooled_ids:
+            continue
+        print(f"\n  PER {label}  (sorted by delta)")
+        print(f"    {'name':<28} {'n':>5} {'before':>8} {'after':>8} "
+              f"{'delta':>8} {'p':>10}")
+        for val, cn, ca, cb, d, pv in sorted(rows_out, key=lambda r: -r[4]):
+            star = " *" if pv < 0.05 else ""
+            print(f"    {val:<28} {cn:>5} {ca:>8.3f} {cb:>8.3f} "
+                  f"{d:>+8.3f} {pv:>10.2g}{star}")
+        if pooled_ids:
+            pa = sum(a[s]["correct"] for s in pooled_ids) / len(pooled_ids)
+            pb = sum(b[s]["correct"] for s in pooled_ids) / len(pooled_ids)
+            print(f"    {f'[groups with n<{min_n}]':<28} {len(pooled_ids):>5} "
+                  f"{pa:>8.3f} {pb:>8.3f} {pb-pa:>+8.3f}")
+        print("    * p < 0.05 (McNemar, uncorrected for multiple comparisons)")
 
     # regressions are the most informative rows in the whole report
     regressions = [s for s in shared if a[s]["correct"] and not b[s]["correct"]]
@@ -319,7 +381,7 @@ def main() -> None:
         summary = report_single(base, top_k=args.top_k)
 
     if args.json_out:
-        args.json_out.write_text(json.dumps(summary, indent=2))
+        args.json_out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         print(f"\n[out] {args.json_out}")
 
 

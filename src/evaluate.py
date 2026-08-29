@@ -40,16 +40,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--parser", choices=["official", "strict"], default="official",
                    help="generate-mode answer parser; official mirrors theirs")
     p.add_argument("--categories", nargs="*", default=None,
-                   help="Filter by category; omit for all 7 tasks")
+                   help="Filter by the category field")
+    p.add_argument("--sources", nargs="*", default=None,
+                   help="Filter by the source field. On AgroBench this is the "
+                        "task identifier (e.g. did for disease identification)")
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--max-pixels", type=int, default=512 * 28 * 28,
                    help="Vision token budget. Must match across compared runs.")
     p.add_argument("--shuffle-seed", type=int, default=None,
                    help="Permute options to measure position bias")
+    p.add_argument("--shuffle-images", type=int, default=None,
+                   help="CONTROL: pair each question with another sample's "
+                        "image (seeded derangement). A model genuinely using "
+                        "the image should collapse toward chance. If accuracy "
+                        "survives, it learned text priors, not vision.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-4bit", action="store_true")
     p.add_argument("--dataset-id", default=DATASET_ID)
     p.add_argument("--split", default="train")
+    p.add_argument("--local-jsonl", type=Path, default=None,
+                   help="evaluate a locally built MCQ file (see build_mcq.py) "
+                        "instead of the gated Hub dataset")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--list-categories", action="store_true",
                    help="Print category counts and exit (no model loaded)")
@@ -60,7 +71,7 @@ def load_done_ids(path: Path) -> set[str]:
     if not path.exists():
         return set()
     done = set()
-    with path.open() as fh:
+    with path.open(encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line:
@@ -86,11 +97,14 @@ def run_config(args, extra: dict) -> dict:
         "parser": args.parser,
         "max_pixels": args.max_pixels,
         "shuffle_seed": args.shuffle_seed,
+        "shuffle_images": args.shuffle_images,
         "seed": args.seed,
         "quantized_4bit": not args.no_4bit,
-        "dataset_id": args.dataset_id,
+        "dataset_id": (str(args.local_jsonl) if args.local_jsonl
+                       else args.dataset_id),
         "split": args.split,
         "categories": args.categories,
+        "sources": args.sources,
         "limit": args.limit,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
@@ -98,20 +112,122 @@ def run_config(args, extra: dict) -> dict:
     return cfg
 
 
+def load_local_jsonl(path: Path) -> list[dict]:
+    """Read locally built MCQ records and lazily attach images.
+
+    Images are opened on access rather than all at once, so a 5,000-question
+    set does not need to fit in RAM.
+    """
+    from PIL import Image
+
+    class LazyRow(dict):
+        def __getitem__(self, key):
+            if key == "image" and "image" not in self:
+                return Image.open(super().__getitem__("image_path"))
+            return super().__getitem__(key)
+
+        def get(self, key, default=None):
+            try:
+                return self[key]
+            except KeyError:
+                return default
+
+    rows = []
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rows.append(LazyRow(json.loads(line)))
+    return rows
+
+
+def derange_images(rows: list, seed: int) -> list:
+    """Reassign every question a different sample's image.
+
+    This is the control that separates "the model reads the image" from "the
+    model learned which answer tends to be correct". A model using visual
+    evidence should fall to near chance here. One that holds its accuracy has
+    learned the text distribution, and its headline number means nothing.
+
+    A derangement is used rather than a plain shuffle, so no sample keeps its
+    own image by luck. Preference is given to donors of a DIFFERENT class, so
+    a question about late blight does not accidentally receive another late
+    blight image and score correctly for the right reason.
+    """
+    import random as _random
+
+    n = len(rows)
+    if n < 2:
+        return rows
+
+    rng = _random.Random(seed)
+    order = list(range(n))
+    labels = [r["answer"] for r in rows]
+    paths = [r["image_path"] for r in rows]
+
+    for _ in range(200):
+        rng.shuffle(order)
+        if all(order[i] != i for i in range(n)):
+            break
+    else:  # fall back to a rotation, which is always a derangement
+        order = [(i + 1) % n for i in range(n)]
+
+    # Try to repair same-class assignments by swapping with a later index.
+    for i in range(n):
+        if labels[order[i]] == labels[i]:
+            for j in range(n):
+                if (i != j and labels[order[j]] != labels[i]
+                        and labels[order[i]] != labels[j]
+                        and order[j] != i and order[i] != j):
+                    order[i], order[j] = order[j], order[i]
+                    break
+
+    same = sum(1 for i in range(n) if labels[order[i]] == labels[i])
+    print(f"[control] {same}/{n} ({same/n:.1%}) deranged images still share the "
+          "gold class; those can be correct by chance")
+
+    for i, row in enumerate(rows):
+        row["image_path"] = paths[order[i]]
+        row.pop("image", None)
+    return rows
+
+
 def main() -> None:
     args = parse_args()
-    from datasets import load_dataset
 
-    print(f"[info] loading {args.dataset_id} ({args.split})")
-    ds = load_dataset(args.dataset_id, split=args.split)
-    print(f"[info] {len(ds)} rows")
+    if args.local_jsonl:
+        print(f"[info] loading local MCQ file {args.local_jsonl}")
+        ds = load_local_jsonl(args.local_jsonl)
+        print(f"[info] {len(ds)} rows")
+    else:
+        from datasets import load_dataset
+
+        print(f"[info] loading {args.dataset_id} ({args.split})")
+        ds = load_dataset(args.dataset_id, split=args.split)
+        print(f"[info] {len(ds)} rows")
+
+    if args.shuffle_images is not None:
+        if not args.local_jsonl:
+            raise SystemExit("--shuffle-images requires --local-jsonl")
+        ds = derange_images(ds, args.shuffle_images)
+        print(f"[control] images deranged with seed {args.shuffle_images}; "
+              "no sample keeps its own image")
 
     if args.list_categories:
         from collections import Counter
-        counts = Counter(ds["category"])
-        width = max(len(c) for c in counts)
-        for cat, n in counts.most_common():
-            print(f"  {cat:<{width}}  {n:>5}")
+        for field in ("source", "category"):
+            try:
+                counts = Counter(str(r.get(field, "")) for r in ds)
+            except Exception:
+                continue
+            if not counts or list(counts) == [""]:
+                continue
+            print(f"\n=== {field} ({len(counts)} distinct) ===")
+            width = max(len(c) for c in counts)
+            for name, n in counts.most_common(40):
+                print(f"  {name:<{width}}  {n:>5}")
+            if len(counts) > 40:
+                print(f"  ... and {len(counts)-40} more")
         return
 
     outdir = Path(args.outdir)
@@ -143,7 +259,8 @@ def main() -> None:
         "torch_version": torch.__version__,
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
     }
-    cfg_path.write_text(json.dumps(run_config(args, env), indent=2))
+    cfg_path.write_text(json.dumps(run_config(args, env), indent=2),
+                        encoding="utf-8")
 
     if args.decode == "logit":
         def scorer(lm_, img, prompt, n_opts, opts):
@@ -157,10 +274,11 @@ def main() -> None:
     n_done = n_correct = 0
     start = time.time()
 
-    with out_path.open("a") as fh:
+    with out_path.open("a", encoding="utf-8") as fh:
         for sample in iter_samples(
             ds,
             categories=args.categories,
+            sources=args.sources,
             limit=args.limit,
             shuffle_seed=args.shuffle_seed,
             prompt_style=args.prompt_style,
@@ -182,6 +300,7 @@ def main() -> None:
             record = {
                 "sample_id": sample.sample_id,
                 "category": sample.category,
+                "source": sample.source,
                 "crop": sample.crop,
                 "question": sample.question,
                 "options": sample.options,

@@ -1,0 +1,19 @@
+{
+  "model_id": "Qwen/Qwen2-VL-2B-Instruct",
+  "adapter_path": "checkpoints\\lora_lang",
+  "decode": "logit",
+  "prompt_style": "official",
+  "parser": "official",
+  "max_pixels": 401408,
+  "shuffle_seed": null,
+  "seed": 0,
+  "quantized_4bit": true,
+  "dataset_id": "data\\pv_test.jsonl",
+  "split": "train",
+  "categories": null,
+  "limit": null,
+  "timestamp": "2026-08-29T10:06:31",
+  "transformers_version": "5.16.1",
+  "torch_version": "2.5.1+cu121",
+  "gpu": "NVIDIA GeForce RTX 4060"
+}

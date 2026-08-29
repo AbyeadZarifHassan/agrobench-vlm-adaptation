@@ -279,7 +279,14 @@ def make_sample(
     """Build a Sample from a raw dataset row, resolving the gold answer."""
     options = [str(o) for o in row["options"]]
     gold = resolve_gold_index(row["answer"], options)
-    sid = str(row.get("id") or f"idx{index}")
+
+    # AgroBench reuses the same `id` across several questions about one image,
+    # so the raw field is not a key. The row index is appended to make it
+    # unique. Iteration order over a fixed dataset is deterministic, so the
+    # composite id is stable across runs and machines -- which is what resume
+    # and paired comparison both depend on.
+    raw_id = row.get("id")
+    sid = f"{raw_id}#{index}" if raw_id else f"idx{index}"
 
     if shuffle_seed is not None:
         options, gold = permute_options(options, gold, shuffle_seed, sid)
@@ -300,15 +307,19 @@ def make_sample(
 def iter_samples(
     dataset: Iterable[dict],
     categories: Sequence[str] | None = None,
+    sources: Sequence[str] | None = None,
     limit: int | None = None,
     shuffle_seed: int | None = None,
     prompt_style: str = "official",
 ) -> Iterable[Sample]:
     """Yield Samples, skipping and reporting rows whose gold cannot be resolved."""
     wanted = {c.lower() for c in categories} if categories else None
+    wanted_src = {s.lower() for s in sources} if sources else None
     kept = 0
     for i, row in enumerate(dataset):
         if wanted and str(row.get("category", "")).lower() not in wanted:
+            continue
+        if wanted_src and str(row.get("source", "")).lower() not in wanted_src:
             continue
         try:
             sample = make_sample(

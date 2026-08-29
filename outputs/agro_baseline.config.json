@@ -1,0 +1,21 @@
+{
+  "model_id": "Qwen/Qwen2-VL-2B-Instruct",
+  "adapter_path": null,
+  "decode": "logit",
+  "prompt_style": "official",
+  "parser": "official",
+  "max_pixels": 401408,
+  "shuffle_seed": null,
+  "shuffle_images": null,
+  "seed": 0,
+  "quantized_4bit": true,
+  "dataset_id": "risashinoda/AgroBench",
+  "split": "train",
+  "categories": null,
+  "sources": null,
+  "limit": null,
+  "timestamp": "2026-08-29T11:56:49",
+  "transformers_version": "5.16.1",
+  "torch_version": "2.5.1+cu121",
+  "gpu": "NVIDIA GeForce RTX 4060"
+}

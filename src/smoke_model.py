@@ -84,15 +84,30 @@ def main() -> None:
     print(prompt)
     print("--------------\n")
 
+    # The first forward pass pays for CUDA kernel autotuning, lazy module
+    # init and allocator warmup. Timing it would overstate the per-sample cost
+    # by roughly an order of magnitude, so burn one pass before measuring.
+    _ = score_by_letter_logits(lm, image, prompt, len(options))
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    n_reps = 3
     t0 = time.time()
-    logit_out = score_by_letter_logits(lm, image, prompt, len(options))
-    dt_logit = time.time() - t0
+    for _ in range(n_reps):
+        logit_out = score_by_letter_logits(lm, image, prompt, len(options))
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    dt_logit = (time.time() - t0) / n_reps
+
     print(f"[ok] logit mode  -> {options[logit_out['pred_index']]!r} "
-          f"(conf {logit_out['confidence']:.3f})  {dt_logit:.2f}s")
+          f"(conf {logit_out['confidence']:.3f})  {dt_logit:.2f}s/sample "
+          f"(mean of {n_reps}, after warmup)")
     print(f"     letter scores: {logit_out['letter_scores']}")
 
     t0 = time.time()
     gen_out = score_by_generation(lm, image, prompt, len(options))
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     dt_gen = time.time() - t0
     parsed = (options[gen_out["pred_index"]]
               if gen_out["pred_index"] is not None else "UNPARSEABLE")

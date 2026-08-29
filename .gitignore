@@ -1,5 +1,8 @@
 ﻿.venv/
-outputs/
-checkpoints/
 __pycache__/
 *.pyc
+PlantDoc/
+PlantVillageDataset/
+AgroBench-official/
+checkpoints/
+data/*.jsonl
